@@ -15,7 +15,7 @@ categories = ["accessibility", "simulation"]
 
 [dependencies]
 # Barter Ecosystem
-barter-data = { git = "https://github.com/lordisma/barter-data-rs", branch = "develop" }
+barter-data = { git = "https://github.com/lordisma/barter-data-rs", branch = "epic/castor-adaptor" }
 barter-integration = "0.5.1"
 
 # Logging
