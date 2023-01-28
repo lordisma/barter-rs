@@ -16,7 +16,7 @@ use barter_integration::model::{Market, MarketId};
 use parking_lot::Mutex;
 use prettytable::Table;
 use serde::Serialize;
-use std::{collections::HashMap, fmt::Debug, sync::Arc, thread};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -153,6 +153,29 @@ where
         EngineBuilder::new()
     }
 
+    /// Run the consumer of commands for the engines, this method will be ran into the main main
+    /// method. The aim of this method is to process internal commands
+    async fn process_commands(&mut self) {
+        while let Some(command) = self.command_rx.recv().await {
+            match command {
+                Command::FetchOpenPositions(position_tx) => {
+                    self.fetch_open_positions(position_tx).await;
+                },
+                Command::Terminate(message) => {
+                    info!("Received termination command");
+                    self.terminate_traders(message).await;
+                    break;
+                },
+                Command::ExitPosition(market) => {
+                    self.exit_position(market).await;
+                },
+                Command::ExitAllPositions => {
+                    self.exit_all_positions().await;
+                }
+            }
+        }
+    }
+
     /// Run the trading [`Engine`]. Spawns a thread for each [`Trader`] to run on. Asynchronously
     /// receives [`Command`]s via the `command_rx` and actions them
     /// (eg/ terminate_traders, fetch_open_positions). If all of the [`Trader`]s stop organically
@@ -160,64 +183,46 @@ where
     /// for the trading session.
     pub async fn run(mut self) {
         // Run Traders on threads & send notification when they have stopped organically
-        let mut notify_traders_stopped = self.run_traders().await;
+        let notify_traders_stopped = self.run_traders();
 
-        loop {
-            // Action received commands from remote, or wait for all Traders to stop organically
-            tokio::select! {
-                _ = notify_traders_stopped.recv() => {
-                    break;
-                },
-
-                command = self.command_rx.recv() => {
-                    if let Some(command) = command {
-                        match command {
-                            Command::FetchOpenPositions(positions_tx) => {
-                                self.fetch_open_positions(positions_tx).await;
-                            },
-                            Command::Terminate(message) => {
-                                self.terminate_traders(message).await;
-                                break;
-                            },
-                            Command::ExitPosition(market) => {
-                                self.exit_position(market).await;
-                            },
-                            Command::ExitAllPositions => {
-                                self.exit_all_positions().await;
-                            },
-                        }
-                    } else {
-                        // Terminate traders due to dropped receiver
-                        break;
-                    }
+        // Action received commands from remote, or wait for all Traders to stop organically
+        tokio::select! {
+            result = notify_traders_stopped => {
+                if let Err(error) = result {
+                    error!(
+                        error = &*format!("{:?}", error),
+                        "Error received when running the main loop"
+                    );
                 }
+            },
+
+            _ = self.process_commands() => {
+                // NOP
             }
         }
-
-        // Print Trading Session Summary
-        self.generate_session_summary().printstd();
     }
 
     /// Runs each [`Trader`] it's own thread. Sends a message on the returned `mpsc::Receiver<bool>`
     /// if all the [`Trader`]s have stopped organically (eg/ due to a finished [`MarketEvent`] feed).
-    async fn run_traders(&mut self) -> mpsc::Receiver<bool> {
+    fn run_traders(&mut self) -> oneshot::Receiver<()> {
         // Extract Traders out of the Engine so we can move them into threads
         let traders = std::mem::take(&mut self.traders);
 
         // Run each Trader instance on it's own thread
         let mut thread_handles = Vec::with_capacity(traders.len());
         for trader in traders.into_iter() {
-            let handle = thread::spawn(move || trader.run());
+            // Make each handler in its own thread of blocking methods
+            let handle = tokio::task::spawn_blocking(move || trader.run());
             thread_handles.push(handle);
         }
 
         // Create channel to notify the Engine when the Traders have stopped organically
-        let (notify_tx, notify_rx) = mpsc::channel(1);
+        let (notify_tx, notify_rx) = oneshot::channel();
 
         // Create Task that notifies Engine when the Traders have stopped organically
         tokio::spawn(async move {
             for handle in thread_handles {
-                if let Err(err) = handle.join() {
+                if let Err(err) = handle.await {
                     error!(
                         error = &*format!("{:?}", err),
                         "Trader thread has panicked during execution",
@@ -225,7 +230,7 @@ where
                 }
             }
 
-            let _ = notify_tx.send(true).await;
+            let _ = notify_tx.send(());
         });
 
         notify_rx
@@ -312,47 +317,6 @@ where
                 "failed to exit Position"
             );
         }
-    }
-
-    /// Generate a trading session summary. Uses the Portfolio's statistics per [`Market`] in
-    /// combination with the average statistics across all [`Market`]s traded.
-    fn generate_session_summary(mut self) -> Table {
-        // Fetch statistics for each Market
-        let stats_per_market = self.trader_command_txs.into_keys().filter_map(|market| {
-            let market_id = MarketId::from(&market);
-
-            match self.portfolio.lock().get_statistics(&market_id) {
-                Ok(statistics) => Some((market_id.0, statistics)),
-                Err(error) => {
-                    error!(
-                        ?error,
-                        ?market,
-                        "failed to get Market statistics when generating trading session summary"
-                    );
-                    None
-                }
-            }
-        });
-
-        // Generate average statistics across all markets using session's exited Positions
-        self.portfolio
-            .lock()
-            .get_exited_positions(self.engine_id)
-            .map(|exited_positions| {
-                self.statistics_summary.generate_summary(&exited_positions);
-            })
-            .unwrap_or_else(|error| {
-                warn!(
-                    ?error,
-                    why = "failed to get exited Positions from Portfolio's repository",
-                    "failed to generate Statistics summary for trading session"
-                );
-            });
-
-        // Combine Total & Per-Market Statistics Into Table
-        crate::statistic::summary::combine(
-            stats_per_market.chain([("Total".to_owned(), self.statistics_summary)]),
-        )
     }
 }
 
